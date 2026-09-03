@@ -6,7 +6,7 @@ WORKDIR /app
 COPY . .
 
 ENV PUPPETEER_SKIP_DOWNLOAD=true
-RUN pnpm install --frozen-lockfile
+RUN pnpm install --no-frozen-lockfile
 RUN pnpm run --recursive --stream --workspace-concurrency 1 --filter 'torah-appview-service...' build -- --force
 
 WORKDIR /app/services/torah-appview
