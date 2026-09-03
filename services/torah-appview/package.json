@@ -1,0 +1,11 @@
+{
+  "name": "torah-appview-service",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@atproto/bsky": "workspace:^",
+    "@atproto/bsync": "workspace:^",
+    "@atproto/crypto": "workspace:^",
+    "@atproto/syntax": "workspace:^"
+  }
+}
