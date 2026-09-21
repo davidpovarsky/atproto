@@ -5,6 +5,7 @@
   "dependencies": {
     "@atproto/bsky": "workspace:^",
     "@atproto/bsync": "workspace:^",
+    "@atproto/common": "workspace:^",
     "@atproto/crypto": "workspace:^",
     "@atproto/syntax": "workspace:^"
   }

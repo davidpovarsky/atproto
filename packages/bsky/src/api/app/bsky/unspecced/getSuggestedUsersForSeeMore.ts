@@ -1,7 +1,8 @@
 import { dedupeStrs, mapDefined, noUndefinedVals } from '@atproto/common'
-import type { Client, DidString } from '@atproto/lex'
+import { type Client, type DidString, isDidString } from '@atproto/lex'
 import { MethodNotImplementedError, type Server } from '@atproto/xrpc-server'
 import type { AppContext } from '../../../../context.js'
+import type { DataPlaneClient } from '../../../../data-plane/index.js'
 import {
   type HydrateCtx,
   type Hydrator,
@@ -59,12 +60,25 @@ export default function (server: Server, ctx: AppContext) {
   })
 }
 
+const localSkeleton = async (
+  input: SkeletonFnInput<Context, Params>,
+): Promise<SkeletonState> => {
+  const { params, ctx } = input
+  const suggestions = await ctx.dataplane.getFollowSuggestions({
+    actorDid: params.hydrateCtx.viewer ?? undefined,
+    limit: params.limit,
+  })
+  return {
+    dids: suggestions.dids.filter(isDidString),
+  }
+}
+
 const skeletonFromGetSuggestedUsersSkeleton = async (
   input: SkeletonFnInput<Context, Params>,
 ): Promise<SkeletonState> => {
   const { params, ctx } = input
   if (!ctx.suggestionsClient) {
-    throw new MethodNotImplementedError('Suggestions agent not available')
+    return localSkeleton(input)
   }
 
   return ctx.suggestionsClient.call(
@@ -88,7 +102,7 @@ const skeletonFromGetSuggestedUsersForSeeMoreSkeleton = async (
   const { params, ctx } = input
 
   if (!ctx.suggestionsClient) {
-    throw new MethodNotImplementedError('Suggestions agent not available')
+    return localSkeleton(input)
   }
 
   return ctx.suggestionsClient.call(
@@ -167,6 +181,7 @@ type Context = {
   hydrator: Hydrator
   views: Views
   suggestionsClient: Client | undefined
+  dataplane: DataPlaneClient
 }
 
 type Params = app.bsky.unspecced.getSuggestedUsersForSeeMore.$Params & {

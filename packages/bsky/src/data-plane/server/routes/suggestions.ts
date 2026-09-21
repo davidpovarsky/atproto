@@ -48,6 +48,21 @@ const getFollowSuggestionsGlobal = async (
     .orderBy('suggested_follow.order', 'asc')
     .execute()
 
+  if (suggestions.length === 0) {
+    const fallbackActors = await db.db
+      .selectFrom('actor')
+      .where('takedownRef', 'is', null)
+      .$if(!!input.actorDid, (qb) => qb.where('did', '!=', input.actorDid))
+      .select('did')
+      .orderBy('indexedAt', 'desc')
+      .limit(input.limit ?? 25)
+      .execute()
+    return {
+      dids: fallbackActors.map((a) => a.did),
+      cursor: undefined,
+    }
+  }
+
   // always include first two
   const firstTwo = suggestions.filter(
     (row) => row.order === 1 || row.order === 2,

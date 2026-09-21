@@ -2,6 +2,7 @@ import * as bsky from '@atproto/bsky'
 import * as bsync from '@atproto/bsync'
 import { Secp256k1Keypair } from '@atproto/crypto'
 import type { DidString } from '@atproto/syntax'
+import { initChatTables, createChatRouter } from './chat.js'
 
 const APPVIEW_PORT = 2584
 const BSYNC_PORT = 2585
@@ -31,6 +32,7 @@ async function main() {
     poolSize: 10,
   })
   await db.migrateToLatestOrThrow()
+  await initChatTables(db.pool)
 
   const dataplane = await bsky.DataPlaneServer.create(
     db,
@@ -90,6 +92,7 @@ async function main() {
   })
 
   const appview = bsky.BskyAppView.create({ config, signingKey })
+  appview.app.use(createChatRouter(db))
   const bsyncSub = new bsky.BsyncSubscription({ config, db })
   const repoSub = new bsky.RepoSubscription({
     service: repoProvider,

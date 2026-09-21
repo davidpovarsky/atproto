@@ -23,7 +23,9 @@ import {
 } from '../../../../data-plane/index.js'
 import type { FeedItem } from '../../../../hydration/feed.js'
 import type { HydrateCtx } from '../../../../hydration/hydrator.js'
+import { parseString } from '../../../../hydration/util.js'
 import { app } from '../../../../lexicons/index.js'
+import type { AtUriString } from '@atproto/syntax'
 import {
   type HydrationFnInput,
   type PresentationFnInput,
@@ -101,22 +103,50 @@ const skeleton = async (
 ): Promise<Skeleton> => {
   const { ctx, params } = inputs
   const timerSkele = new ServerTimer('skele').start()
-  const {
-    feedItems: algoItems,
-    reqId,
-    cursor,
-    resHeaders,
-    ...passthrough
-  } = await skeletonFromFeedGen(ctx, params)
+  try {
+    const {
+      feedItems: algoItems,
+      reqId,
+      cursor,
+      resHeaders,
+      ...passthrough
+    } = await skeletonFromFeedGen(ctx, params)
 
-  return {
-    cursor,
-    items: algoItems,
-    reqId,
-    timerSkele: timerSkele.stop(),
-    timerHydr: new ServerTimer('hydr').start(),
-    resHeaders,
-    passthrough,
+    return {
+      cursor,
+      items: algoItems,
+      reqId,
+      timerSkele: timerSkele.stop(),
+      timerHydr: new ServerTimer('hydr').start(),
+      resHeaders,
+      passthrough,
+    }
+  } catch (err) {
+    if (
+      params.feed.endsWith('/app.bsky.feed.generator/whats-hot') ||
+      params.feed.includes('whats-hot') ||
+      err instanceof InvalidRequestError ||
+      err instanceof UpstreamFailureError
+    ) {
+      const res = await ctx.dataplane.searchPosts({
+        term: '',
+        limit: params.limit,
+        cursor: params.cursor,
+      })
+      const items: AlgoResponseItem[] = res.uris.map((uri) => ({
+        post: { uri: uri as AtUriString },
+      }))
+      return {
+        cursor: parseString(res.cursor),
+        items,
+        reqId: undefined,
+        timerSkele: timerSkele.stop(),
+        timerHydr: new ServerTimer('hydr').start(),
+        resHeaders: undefined,
+        passthrough: {},
+      }
+    }
+    throw err
   }
 }
 

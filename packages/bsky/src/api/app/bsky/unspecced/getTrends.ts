@@ -52,8 +52,7 @@ const skeleton: SkeletonFn<Context, Params, SkeletonState> = async (input) => {
   const { params, ctx } = input
 
   if (!ctx.irisClient) {
-    // Use 501 instead of 500 as these are not considered retry-able by clients
-    throw new MethodNotImplementedError('Topics agent not available')
+    return { trends: [] }
   }
 
   const skeleton = await ctx.irisClient.call(

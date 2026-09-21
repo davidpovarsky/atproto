@@ -50,8 +50,7 @@ const skeleton = async (
   const { params, ctx } = input
 
   if (!ctx.topicsClient) {
-    // Use 501 instead of 500 as these are not considered retry-able by clients
-    throw new MethodNotImplementedError('Topics agent not available')
+    return { feeds: [] }
   }
 
   return ctx.topicsClient.call(

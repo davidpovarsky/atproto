@@ -12,9 +12,10 @@ export default function (server: Server, ctx: AppContext) {
     auth: ctx.authVerifier.standard,
     handler: async ({ auth, input }) => {
       if (!ctx.courierClient) {
-        throw new MethodNotImplementedError(
-          'This service is not configured to support push token registration.',
-        )
+        return {
+          encoding: 'application/json',
+          body: {},
+        }
       }
       const { token, platform, serviceDid, appId, ageRestricted } = input.body
       const did = auth.credentials.iss
