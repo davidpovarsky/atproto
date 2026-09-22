@@ -51,7 +51,7 @@ function getCallerDid(req: Request): string {
     const parts = token.split('.')
     if (parts.length < 2) throw new Error('Invalid JWT format')
     const payload = JSON.parse(Buffer.from(parts[1], 'base64url').toString('utf8'))
-    const did = (payload.iss || payload.sub) as string
+    const did = (payload.sub || payload.iss) as string
     if (!did || typeof did !== 'string' || !did.startsWith('did:')) {
       throw new Error('Invalid token issuer')
     }
