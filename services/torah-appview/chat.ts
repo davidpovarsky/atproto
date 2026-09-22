@@ -36,23 +36,63 @@ export async function initChatTables(pool: any) {
   `)
 }
 
+class ChatAuthError extends Error {
+  status: number
+  constructor(message: string, status = 401) {
+    super(message)
+    this.name = 'ChatAuthError'
+    this.status = status
+  }
+}
+
+class ChatForbiddenError extends Error {
+  status = 403
+  constructor(message = 'Not a member of this convo') {
+    super(message)
+    this.name = 'ChatForbiddenError'
+    this.status = 403
+  }
+}
+
 function getCallerDid(req: Request): string {
   const authHeader = req.headers.authorization
   if (!authHeader || !authHeader.startsWith('Bearer ')) {
-    throw new Error('Authentication required')
+    throw new ChatAuthError('Authentication required', 401)
   }
   const token = authHeader.slice(7).trim()
   try {
     const parts = token.split('.')
-    if (parts.length < 2) throw new Error('Invalid JWT format')
-    const payload = JSON.parse(Buffer.from(parts[1], 'base64url').toString('utf8'))
+    if (parts.length !== 3) throw new ChatAuthError('Invalid JWT format', 401)
+    const payload = JSON.parse(Buffer.from(parts[1], 'base64url').toString('utf8')) as {
+      iss?: string
+      sub?: string
+      exp?: number
+    }
+    // Check expiry
+    if (typeof payload.exp === 'number' && Date.now() / 1000 > payload.exp) {
+      throw new ChatAuthError('JWT expired', 401)
+    }
     const did = (payload.iss || payload.sub) as string
     if (!did || typeof did !== 'string' || !did.startsWith('did:')) {
-      throw new Error('Invalid token issuer')
+      throw new ChatAuthError('Invalid token issuer', 401)
     }
     return did
-  } catch (err: any) {
-    throw new Error('Invalid auth token: ' + (err?.message || 'unknown'))
+  } catch (err: unknown) {
+    if (err instanceof ChatAuthError) throw err
+    throw new ChatAuthError(
+      'Invalid auth token: ' + (err instanceof Error ? err.message : 'unknown'),
+      401,
+    )
+  }
+}
+
+async function assertMembership(pool: unknown, convoId: string, callerDid: string) {
+  const res = await (pool as { query: (sql: string, params: unknown[]) => Promise<{ rows: unknown[] }> }).query(
+    'SELECT 1 FROM torah_appview.chat_member WHERE convo_id = $1 AND did = $2',
+    [convoId, callerDid],
+  )
+  if (res.rows.length === 0) {
+    throw new ChatForbiddenError()
   }
 }
 
@@ -245,13 +285,22 @@ export function createChatRouter(db: Database): Router {
       if (!convoId) {
         return res.status(400).json({ error: 'InvalidRequest', message: 'convoId is required' })
       }
+      // Verify caller is a member before exposing convo data
+      await assertMembership(db.pool, convoId, callerDid)
       const convo = await buildConvoView(db.pool, convoId, callerDid)
       if (!convo) {
         return res.status(404).json({ error: 'NotFound', message: 'Convo not found' })
       }
       return res.json({ convo })
-    } catch (err: any) {
-      return res.status(500).json({ error: 'InternalServerError', message: err?.message || 'Chat error' })
+    } catch (err: unknown) {
+      if (err instanceof ChatAuthError) {
+        return res.status(err.status).json({ error: 'AuthRequired', message: err.message })
+      }
+      if (err instanceof ChatForbiddenError) {
+        return res.status(403).json({ error: 'Forbidden', message: err.message })
+      }
+      const message = err instanceof Error ? err.message : 'Chat error'
+      return res.status(500).json({ error: 'InternalServerError', message })
     }
   })
 
@@ -382,11 +431,14 @@ export function createChatRouter(db: Database): Router {
   router.post('/xrpc/chat.bsky.convo.sendMessageBatch', async (req: Request, res: Response) => {
     try {
       const callerDid = getCallerDid(req)
-      const items = req.body?.items || []
-      const results: any[] = []
+      const items: Array<{ convoId: string; message: { text: string; facets?: unknown; embed?: unknown } }> = req.body?.items || []
+      const results: unknown[] = []
 
       for (const item of items) {
         const { convoId, message } = item
+        // Verify membership for EVERY convo in the batch
+        await assertMembership(db.pool, convoId, callerDid)
+
         const msgId = `m_${TID.nextStr()}`
         const rev = TID.nextStr()
         const now = new Date()
@@ -424,18 +476,26 @@ export function createChatRouter(db: Database): Router {
       }
 
       return res.json({ items: results })
-    } catch (err: any) {
-      return res.status(500).json({ error: 'InternalServerError', message: err?.message || 'Chat error' })
+    } catch (err: unknown) {
+      if (err instanceof ChatAuthError) {
+        return res.status(err.status).json({ error: 'AuthRequired', message: err.message })
+      }
+      if (err instanceof ChatForbiddenError) {
+        return res.status(403).json({ error: 'Forbidden', message: err.message })
+      }
+      const message = err instanceof Error ? err.message : 'Chat error'
+      return res.status(500).json({ error: 'InternalServerError', message })
     }
   })
 
   router.post('/xrpc/chat.bsky.convo.updateRead', async (req: Request, res: Response) => {
     try {
       const callerDid = getCallerDid(req)
-      const { convoId, messageId } = req.body || {}
+      const { convoId, messageId } = (req.body || {}) as { convoId?: string; messageId?: string }
       if (!convoId) {
         return res.status(400).json({ error: 'InvalidRequest', message: 'convoId is required' })
       }
+      await assertMembership(db.pool, convoId, callerDid)
 
       await db.pool.query(
         'UPDATE torah_appview.chat_member SET last_read_message_id = $1 WHERE convo_id = $2 AND did = $3',
@@ -444,8 +504,15 @@ export function createChatRouter(db: Database): Router {
 
       const convo = await buildConvoView(db.pool, convoId, callerDid)
       return res.json({ convo })
-    } catch (err: any) {
-      return res.status(500).json({ error: 'InternalServerError', message: err?.message || 'Chat error' })
+    } catch (err: unknown) {
+      if (err instanceof ChatAuthError) {
+        return res.status(err.status).json({ error: 'AuthRequired', message: err.message })
+      }
+      if (err instanceof ChatForbiddenError) {
+        return res.status(403).json({ error: 'Forbidden', message: err.message })
+      }
+      const message = err instanceof Error ? err.message : 'Chat error'
+      return res.status(500).json({ error: 'InternalServerError', message })
     }
   })
 
@@ -456,44 +523,77 @@ export function createChatRouter(db: Database): Router {
   router.post('/xrpc/chat.bsky.convo.muteConvo', async (req: Request, res: Response) => {
     try {
       const callerDid = getCallerDid(req)
-      const { convoId } = req.body || {}
+      const { convoId } = (req.body || {}) as { convoId?: string }
+      if (!convoId) {
+        return res.status(400).json({ error: 'InvalidRequest', message: 'convoId is required' })
+      }
+      await assertMembership(db.pool, convoId, callerDid)
       await db.pool.query(
         'UPDATE torah_appview.chat_member SET muted = true WHERE convo_id = $1 AND did = $2',
         [convoId, callerDid],
       )
       const convo = await buildConvoView(db.pool, convoId, callerDid)
       return res.json({ convo })
-    } catch (err: any) {
-      return res.status(500).json({ error: 'InternalServerError', message: err?.message || 'Chat error' })
+    } catch (err: unknown) {
+      if (err instanceof ChatAuthError) {
+        return res.status(err.status).json({ error: 'AuthRequired', message: err.message })
+      }
+      if (err instanceof ChatForbiddenError) {
+        return res.status(403).json({ error: 'Forbidden', message: err.message })
+      }
+      const message = err instanceof Error ? err.message : 'Chat error'
+      return res.status(500).json({ error: 'InternalServerError', message })
     }
   })
 
   router.post('/xrpc/chat.bsky.convo.unmuteConvo', async (req: Request, res: Response) => {
     try {
       const callerDid = getCallerDid(req)
-      const { convoId } = req.body || {}
+      const { convoId } = (req.body || {}) as { convoId?: string }
+      if (!convoId) {
+        return res.status(400).json({ error: 'InvalidRequest', message: 'convoId is required' })
+      }
+      await assertMembership(db.pool, convoId, callerDid)
       await db.pool.query(
         'UPDATE torah_appview.chat_member SET muted = false WHERE convo_id = $1 AND did = $2',
         [convoId, callerDid],
       )
       const convo = await buildConvoView(db.pool, convoId, callerDid)
       return res.json({ convo })
-    } catch (err: any) {
-      return res.status(500).json({ error: 'InternalServerError', message: err?.message || 'Chat error' })
+    } catch (err: unknown) {
+      if (err instanceof ChatAuthError) {
+        return res.status(err.status).json({ error: 'AuthRequired', message: err.message })
+      }
+      if (err instanceof ChatForbiddenError) {
+        return res.status(403).json({ error: 'Forbidden', message: err.message })
+      }
+      const message = err instanceof Error ? err.message : 'Chat error'
+      return res.status(500).json({ error: 'InternalServerError', message })
     }
   })
 
   router.post('/xrpc/chat.bsky.convo.leaveConvo', async (req: Request, res: Response) => {
     try {
       const callerDid = getCallerDid(req)
-      const { convoId } = req.body || {}
+      const { convoId } = (req.body || {}) as { convoId?: string }
+      if (!convoId) {
+        return res.status(400).json({ error: 'InvalidRequest', message: 'convoId is required' })
+      }
+      await assertMembership(db.pool, convoId, callerDid)
       await db.pool.query(
         'DELETE FROM torah_appview.chat_member WHERE convo_id = $1 AND did = $2',
         [convoId, callerDid],
       )
       return res.json({ convoId, rev: TID.nextStr() })
-    } catch (err: any) {
-      return res.status(500).json({ error: 'InternalServerError', message: err?.message || 'Chat error' })
+    } catch (err: unknown) {
+      if (err instanceof ChatAuthError) {
+        return res.status(err.status).json({ error: 'AuthRequired', message: err.message })
+      }
+      if (err instanceof ChatForbiddenError) {
+        return res.status(403).json({ error: 'Forbidden', message: err.message })
+      }
+      const message = err instanceof Error ? err.message : 'Chat error'
+      return res.status(500).json({ error: 'InternalServerError', message })
     }
   })
 
