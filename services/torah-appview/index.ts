@@ -594,7 +594,16 @@ async function main() {
   })
 
   const appview = bsky.BskyAppView.create({ config, signingKey })
-  appview.app.use(createChatRouter(db))
+  const chatRouter = createChatRouter(db)
+  appview.app.use(chatRouter)
+  const stack = (appview.app as any)._router.stack
+  const chatLayer = stack.pop()
+  const serverIndex = stack.findIndex((l: any) => l.name === 'router')
+  if (serverIndex !== -1) {
+    stack.splice(serverIndex, 0, chatLayer)
+  } else {
+    stack.unshift(chatLayer)
+  }
   const bsyncSub = new bsky.BsyncSubscription({ config, db })
   const repoSub = new bsky.RepoSubscription({
     service: repoProvider,
