@@ -15,7 +15,6 @@ on:
       - "Sync to internal repo"
       - "Torah Social AppView"
     types:
-      - requested
       - in_progress
       - completed
 
