@@ -11,6 +11,7 @@ on:
   pull_request:
 
 permissions:
+  actions: read
   contents: write # push the changeset commit
 
 concurrency:
@@ -30,6 +31,14 @@ jobs:
       github.event.pull_request.head.repo.full_name == github.repository &&
       github.event.sender.login != 'github-actions[bot]'
     steps:
+      - name: Live Activity · refresh
+        uses: davidpovarsky/github-automation/live-refresh@main
+        continue-on-error: true
+        with:
+          event: refresh
+          device_id: ${{ secrets.NOTIFY_DEVICE_ID }}
+          token: ${{ secrets.NOTIFY_DEVICE_TOKEN }}
+          github_token: ${{ github.token }}
       - uses: actions/checkout@v7
         with:
           # The event's head commit, not the merge ref (so the push below is a
@@ -39,6 +48,14 @@ jobs:
           ref: ${{ github.event.pull_request.head.sha }}
           fetch-depth: 0 # needed for git diff against base branch
 
+      - name: Live Activity · refresh
+        uses: davidpovarsky/github-automation/live-refresh@main
+        continue-on-error: true
+        with:
+          event: refresh
+          device_id: ${{ secrets.NOTIFY_DEVICE_ID }}
+          token: ${{ secrets.NOTIFY_DEVICE_TOKEN }}
+          github_token: ${{ github.token }}
       - name: Generate and push changeset
         id: generate
         env: # env indirection: never interpolate PR-controlled strings into the script
