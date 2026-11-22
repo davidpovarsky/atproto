@@ -68,13 +68,43 @@ async function makeToken(
 
 type QueryCall = { sql: string; params: unknown[] }
 
-function makePool() {
+type FixtureOptions = {
+  active?: boolean
+  policy?: Partial<{
+    callerActive: boolean
+    recipientActive: boolean
+    blocked: boolean
+    recipientFollowsCaller: boolean
+    declaration: string | null
+    declarationTakedown: string | null
+    convoId: string | null
+  }>
+}
+
+function makePool(options: FixtureOptions = {}) {
   const queries: QueryCall[] = []
   const pool = {
     query(sql: string, params: unknown[] = []) {
       queries.push({ sql, params })
       let rows: Record<string, unknown>[] = []
-      if (sql.includes('SELECT 1 FROM torah_appview.chat_member')) {
+      if (sql.includes('AS "callerActive"')) {
+        rows = [
+          {
+            callerActive: true,
+            recipientActive: true,
+            blocked: false,
+            recipientFollowsCaller: false,
+            declaration: JSON.stringify({ allowIncoming: 'all' }),
+            declarationTakedown: null,
+            convoId: CONVO_AB,
+            ...options.policy,
+          },
+        ]
+      } else if (sql.includes('SELECT 1 FROM torah_appview.actor')) {
+        rows = options.active === false ? [] : [{ active: 1 }]
+      } else if (sql.startsWith('SELECT did FROM torah_appview.chat_member')) {
+        rows = params[0] === CONVO_AB ? [{ did: DID_A }, { did: DID_B }] : []
+      } else if (sql.includes('SELECT 1 FROM torah_appview.chat_member')) {
         if (
           params[0] === CONVO_AB &&
           [DID_A, DID_B].includes(String(params[1]))
@@ -119,8 +149,11 @@ function makePool() {
   return { pool, queries }
 }
 
-async function startFixture(authenticate?: AuthenticateChatRequest) {
-  const { pool, queries } = makePool()
+async function startFixture(
+  authenticate?: AuthenticateChatRequest,
+  options: FixtureOptions = {},
+) {
+  const { pool, queries } = makePool(options)
   const verifier = makeVerifier()
   const app = express()
   app.use(
@@ -181,6 +214,7 @@ const chatRoutes = [
   { method: 'POST', nsid: 'chat.bsky.convo.updateRead' },
   { method: 'GET', nsid: 'chat.bsky.convo.getLog' },
   { method: 'GET', nsid: 'chat.bsky.convo.getUnreadCounts' },
+  { method: 'GET', nsid: 'chat.bsky.convo.getConvoAvailability' },
   { method: 'POST', nsid: 'chat.bsky.convo.muteConvo' },
   { method: 'POST', nsid: 'chat.bsky.convo.unmuteConvo' },
   { method: 'POST', nsid: 'chat.bsky.convo.leaveConvo' },
@@ -511,5 +545,152 @@ describe('chat membership and read state', () => {
     )
     expect(response.status).toBe(400)
     expect(fixture.queries).toHaveLength(0)
+  })
+})
+
+describe('direct chat availability and enforcement', () => {
+  test.each([true, false])(
+    'actor active=%s returns the current status schema',
+    async (active) => {
+      await using fixture = await startFixture(undefined, { active })
+      const token = await makeToken(DID_A, 'chat.bsky.actor.getStatus')
+      const response = await fixture.request(
+        'GET',
+        '/xrpc/chat.bsky.actor.getStatus',
+        token,
+      )
+      expect(response).toEqual({
+        status: 200,
+        body: {
+          chatDisabled: !active,
+          canCreateGroups: false,
+          groupMemberLimit: 0,
+        },
+      })
+    },
+  )
+
+  it('returns an existing direct conversation without writing', async () => {
+    await using fixture = await startFixture()
+    const token = await makeToken(DID_A, 'chat.bsky.convo.getConvoAvailability')
+    const response = await fixture.request(
+      'GET',
+      `/xrpc/chat.bsky.convo.getConvoAvailability?members=${DID_B}`,
+      token,
+    )
+    expect(response.status).toBe(200)
+    expect(response.body.canChat).toBe(true)
+    expect(response.body.convo.id).toBe(CONVO_AB)
+    expect(
+      fixture.queries.filter(({ sql }) => /^(INSERT|UPDATE|DELETE)/.test(sql)),
+    ).toHaveLength(0)
+  })
+
+  it('checks a possible new conversation without creating it', async () => {
+    await using fixture = await startFixture(undefined, {
+      policy: { convoId: null },
+    })
+    const token = await makeToken(DID_A, 'chat.bsky.convo.getConvoAvailability')
+    const response = await fixture.request(
+      'GET',
+      `/xrpc/chat.bsky.convo.getConvoAvailability?members=${DID_B}`,
+      token,
+    )
+    expect(response).toEqual({ status: 200, body: { canChat: true } })
+    expect(
+      fixture.queries.filter(({ sql }) => /^(INSERT|UPDATE|DELETE)/.test(sql)),
+    ).toHaveLength(0)
+  })
+
+  test.each([
+    { note: 'no members', members: [] },
+    { note: 'invalid DID', members: ['not-a-did'] },
+    { note: 'self conversation', members: [DID_A] },
+    { note: 'group conversation', members: [DID_B, DID_C] },
+    {
+      note: 'too many entries',
+      members: Array.from({ length: 11 }, () => DID_B),
+    },
+  ])('$note is rejected before a database query', async ({ members }) => {
+    await using fixture = await startFixture()
+    const query = new URLSearchParams()
+    for (const did of members) query.append('members', did)
+    const token = await makeToken(DID_A, 'chat.bsky.convo.getConvoAvailability')
+    const response = await fixture.request(
+      'GET',
+      `/xrpc/chat.bsky.convo.getConvoAvailability?${query}`,
+      token,
+    )
+    expect(response.status).toBe(400)
+    expect(fixture.queries).toHaveLength(0)
+  })
+
+  test.each(['GET', 'POST'])(
+    '%s creation cannot bypass the recipient declaration',
+    async (method) => {
+      await using fixture = await startFixture(undefined, {
+        policy: {
+          convoId: null,
+          declaration: JSON.stringify({ allowIncoming: 'none' }),
+        },
+      })
+      const token = await makeToken(DID_A, 'chat.bsky.convo.getConvoForMembers')
+      const response = await fixture.request(
+        method,
+        `/xrpc/chat.bsky.convo.getConvoForMembers?members=${DID_B}`,
+        token,
+        method === 'POST' ? { members: [DID_B] } : undefined,
+      )
+      expect(response.status).toBe(403)
+      expect(
+        fixture.queries.filter(({ sql }) =>
+          /^(INSERT|UPDATE|DELETE)/.test(sql),
+        ),
+      ).toHaveLength(0)
+    },
+  )
+
+  test.each(['sendMessage', 'sendMessageBatch'])(
+    '%s cannot bypass an existing direct-chat block',
+    async (method) => {
+      await using fixture = await startFixture(undefined, {
+        policy: { blocked: true },
+      })
+      const nsid = `chat.bsky.convo.${method}`
+      const token = await makeToken(DID_A, nsid)
+      const item = { convoId: CONVO_AB, message: { text: 'fixture' } }
+      const response = await fixture.request(
+        'POST',
+        `/xrpc/${nsid}`,
+        token,
+        method === 'sendMessage' ? item : { items: [item] },
+      )
+      expect(response.status).toBe(403)
+      expect(
+        fixture.queries.filter(({ sql }) =>
+          /^(INSERT|UPDATE|DELETE)/.test(sql),
+        ),
+      ).toHaveLength(0)
+    },
+  )
+
+  it('continues an existing direct chat after an incoming-privacy change', async () => {
+    await using fixture = await startFixture(undefined, {
+      policy: { declaration: JSON.stringify({ allowIncoming: 'none' }) },
+    })
+    const token = await makeToken(DID_A, 'chat.bsky.convo.sendMessage')
+    const response = await fixture.request(
+      'POST',
+      '/xrpc/chat.bsky.convo.sendMessage',
+      token,
+      {
+        convoId: CONVO_AB,
+        message: { text: 'fixture in the test database stub' },
+      },
+    )
+    expect(response.status).toBe(200)
+    expect(fixture.queries.some(({ sql }) => sql.startsWith('INSERT'))).toBe(
+      true,
+    )
   })
 })

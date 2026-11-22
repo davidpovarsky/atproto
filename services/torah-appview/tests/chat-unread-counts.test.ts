@@ -10,7 +10,11 @@ import {
   test,
 } from 'vitest'
 import type { Database } from '@atproto/bsky'
-import { getUnreadCounts, initChatTables } from '../chat.ts'
+import {
+  getDirectChatPolicy,
+  getUnreadCounts,
+  initChatTables,
+} from '../chat.ts'
 
 const A = 'did:plc:aaaaaaaaaaaaaaaaaaaaaaaa'
 const B = 'did:plc:bbbbbbbbbbbbbbbbbbbbbbbb'
@@ -56,6 +60,15 @@ beforeEach(async () => {
     CREATE TABLE torah_appview.actor_block (
       creator TEXT NOT NULL,
       "subjectDid" TEXT NOT NULL
+    );
+    CREATE TABLE torah_appview.follow (
+      creator TEXT NOT NULL,
+      "subjectDid" TEXT NOT NULL
+    );
+    CREATE TABLE torah_appview.record (
+      uri TEXT PRIMARY KEY,
+      json TEXT NOT NULL,
+      "takedownRef" TEXT
     );
     CREATE TABLE torah_appview.list_block (
       creator TEXT NOT NULL,
@@ -301,5 +314,191 @@ describe('PostgreSQL unread conversation counts', () => {
       await message(`message-${i}`, id)
     }
     await expectCount(100)
+  })
+})
+
+async function declaration(allowIncoming: unknown): Promise<void> {
+  await client.query(
+    'INSERT INTO torah_appview.record (uri, json) VALUES ($1, $2)',
+    [
+      `at://${B}/chat.bsky.actor.declaration/self`,
+      JSON.stringify({ allowIncoming }),
+    ],
+  )
+}
+
+async function follow(creator: string, subject: string): Promise<void> {
+  await client.query(
+    'INSERT INTO torah_appview.follow (creator, "subjectDid") VALUES ($1, $2)',
+    [creator, subject],
+  )
+}
+
+describe('PostgreSQL direct chat privacy', () => {
+  it('defaults a missing declaration to people the recipient follows', async () => {
+    expect((await getDirectChatPolicy(pool, A, B)).canChat).toBe(false)
+    await follow(B, A)
+    expect((await getDirectChatPolicy(pool, A, B)).canChat).toBe(true)
+  })
+
+  it('does not confuse the sender following the recipient with the reverse relationship', async () => {
+    await follow(A, B)
+    expect((await getDirectChatPolicy(pool, A, B)).canChat).toBe(false)
+  })
+
+  test.each([
+    { note: 'all', setting: 'all', followed: false, expected: true },
+    {
+      note: 'none despite following',
+      setting: 'none',
+      followed: true,
+      expected: false,
+    },
+    {
+      note: 'following without relationship',
+      setting: 'following',
+      followed: false,
+      expected: false,
+    },
+    {
+      note: 'following with relationship',
+      setting: 'following',
+      followed: true,
+      expected: true,
+    },
+    {
+      note: 'unknown value',
+      setting: 'future-setting',
+      followed: true,
+      expected: false,
+    },
+    {
+      note: 'non-string value',
+      setting: true,
+      followed: true,
+      expected: false,
+    },
+  ])(
+    '$note respects the indexed declaration',
+    async ({ setting, followed, expected }) => {
+      await declaration(setting)
+      if (followed) await follow(B, A)
+      expect((await getDirectChatPolicy(pool, A, B)).canChat).toBe(expected)
+      const conversations = await client.query(
+        'SELECT COUNT(*)::int AS count FROM torah_appview.chat_convo',
+      )
+      expect(conversations.rows[0].count).toBe(0)
+    },
+  )
+
+  it('fails closed for malformed declaration JSON', async () => {
+    await client.query(
+      'INSERT INTO torah_appview.record (uri, json) VALUES ($1, $2)',
+      [`at://${B}/chat.bsky.actor.declaration/self`, '{'],
+    )
+    await follow(B, A)
+    expect((await getDirectChatPolicy(pool, A, B)).canChat).toBe(false)
+  })
+
+  it('does not enable new chats from a taken-down declaration', async () => {
+    await declaration('all')
+    await client.query('UPDATE torah_appview.record SET "takedownRef" = $1', [
+      'fixture',
+    ])
+    expect((await getDirectChatPolicy(pool, A, B)).canChat).toBe(false)
+  })
+
+  it('keeps an existing accepted direct chat available after incoming privacy changes', async () => {
+    await conversation()
+    await declaration('none')
+    expect(await getDirectChatPolicy(pool, A, B)).toEqual({
+      canChat: true,
+      convoId: 'direct',
+    })
+  })
+
+  it('does not substitute a group conversation for a direct conversation', async () => {
+    await conversation('group', [A, B, C])
+    await declaration('all')
+    const policy = await getDirectChatPolicy(pool, A, B)
+    expect(policy.canChat).toBe(true)
+    expect(policy.convoId).toBeUndefined()
+    const conversations = await client.query(
+      'SELECT COUNT(*)::int AS count FROM torah_appview.chat_convo',
+    )
+    expect(conversations.rows[0].count).toBe(1)
+  })
+
+  test.each([
+    { note: 'sender block', creator: A, subject: B },
+    { note: 'recipient block', creator: B, subject: A },
+  ])(
+    '$note prevents an existing direct chat from sending',
+    async ({ creator, subject }) => {
+      await conversation()
+      await declaration('all')
+      await client.query(
+        'INSERT INTO torah_appview.actor_block (creator, "subjectDid") VALUES ($1, $2)',
+        [creator, subject],
+      )
+      const policy = await getDirectChatPolicy(pool, A, B)
+      expect(policy.canChat).toBe(false)
+      expect(policy.convoId).toBe('direct')
+    },
+  )
+
+  test.each([
+    { note: 'sender list block', creator: A, subject: B },
+    { note: 'recipient list block', creator: B, subject: A },
+  ])(
+    '$note prevents new and existing direct chats',
+    async ({ creator, subject }) => {
+      await declaration('all')
+      await client.query(
+        'INSERT INTO torah_appview.list_block (creator, "subjectUri") VALUES ($1, $2)',
+        [creator, 'at://fixture/list'],
+      )
+      await client.query(
+        'INSERT INTO torah_appview.list_item ("subjectDid", "listUri") VALUES ($1, $2)',
+        [subject, 'at://fixture/list'],
+      )
+      expect((await getDirectChatPolicy(pool, A, B)).canChat).toBe(false)
+      await conversation()
+      expect((await getDirectChatPolicy(pool, A, B)).canChat).toBe(false)
+    },
+  )
+
+  test.each([
+    { note: 'deactivated sender', did: A, status: 'deactivated' },
+    { note: 'deactivated recipient', did: B, status: 'deactivated' },
+    { note: 'suspended recipient', did: B, status: 'suspended' },
+  ])(
+    '$note cannot use an existing direct conversation',
+    async ({ did, status }) => {
+      await conversation()
+      await declaration('all')
+      await client.query(
+        'UPDATE torah_appview.actor SET "upstreamStatus" = $1 WHERE did = $2',
+        [status, did],
+      )
+      expect((await getDirectChatPolicy(pool, A, B)).canChat).toBe(false)
+    },
+  )
+
+  it('excludes a locally taken-down recipient', async () => {
+    await conversation()
+    await declaration('all')
+    await client.query(
+      'UPDATE torah_appview.actor SET "takedownRef" = $1 WHERE did = $2',
+      ['fixture', B],
+    )
+    expect((await getDirectChatPolicy(pool, A, B)).canChat).toBe(false)
+  })
+
+  it('excludes a missing recipient', async () => {
+    await conversation()
+    await declaration('all')
+    await client.query('DELETE FROM torah_appview.actor WHERE did = $1', [B])
+    expect((await getDirectChatPolicy(pool, A, B)).canChat).toBe(false)
   })
 })

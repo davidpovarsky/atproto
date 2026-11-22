@@ -36,6 +36,21 @@ a read message is deleted. Batch membership is checked before any message
 is written. The existing `getLog` endpoint remains an authenticated empty
 event log; this change does not add event-history storage.
 
+## Direct conversation availability
+
+`getConvoAvailability` only reads existing data. It returns an existing direct
+conversation when present and never creates one. New chats honor the recipient's
+indexed `chat.bsky.actor.declaration/self`: missing declarations default to
+`following`, requiring the recipient to follow the sender. Invalid or unknown
+settings do not enable messages. Creation and sending enforce the same policy.
+
+Existing accepted direct conversations remain usable after incoming-message
+settings change, while unavailable actors and blocks in either direction still
+prevent sending. The existing service has no group-creation implementation:
+`getStatus` reports the current schema with `canCreateGroups: false` and
+`groupMemberLimit: 0`, and `getConvoForMembers` only creates direct chats.
+Existing group membership records are preserved.
+
 ## Verification
 
 Run from `services/torah-appview` after building workspace dependencies:

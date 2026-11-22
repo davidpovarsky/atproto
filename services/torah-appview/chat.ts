@@ -100,15 +100,19 @@ async function assertMembership(
 
 async function getMemberProfile(pool: any, did: string) {
   const res = await pool.query(
-    'SELECT did, handle FROM torah_appview.actor WHERE did = $1',
+    'SELECT did, handle, "takedownRef", "upstreamStatus" FROM torah_appview.actor WHERE did = $1',
     [did],
   )
   const row = res.rows[0]
   return {
     did,
-    handle: row?.handle || did,
+    handle: row?.handle || 'handle.invalid',
     displayName: row?.handle || did,
     avatar: undefined,
+    chatDisabled:
+      !row ||
+      Boolean(row.takedownRef) ||
+      (row.upstreamStatus != null && row.upstreamStatus !== 'active'),
   }
 }
 
@@ -273,6 +277,174 @@ export async function getUnreadCounts(
   return result.rows[0]
 }
 
+type DirectChatPolicy = {
+  canChat: boolean
+  convoId?: string
+}
+
+type DirectChatPolicyRow = {
+  callerActive: boolean
+  recipientActive: boolean
+  blocked: boolean
+  recipientFollowsCaller: boolean
+  declaration: unknown
+  declarationTakedown: string | null
+  convoId: string | null
+}
+
+/** Resolve direct-chat permissions without creating a conversation. */
+export async function getDirectChatPolicy(
+  pool: Database['pool'],
+  callerDid: string,
+  recipientDid: string,
+): Promise<DirectChatPolicy> {
+  if (callerDid === recipientDid) return { canChat: false }
+  const result = await pool.query<DirectChatPolicyRow>(
+    `SELECT
+       EXISTS (
+         SELECT 1 FROM torah_appview.actor
+         WHERE did = $1 AND "takedownRef" IS NULL
+           AND ("upstreamStatus" IS NULL OR "upstreamStatus" = 'active')
+       ) AS "callerActive",
+       EXISTS (
+         SELECT 1 FROM torah_appview.actor
+         WHERE did = $2 AND "takedownRef" IS NULL
+           AND ("upstreamStatus" IS NULL OR "upstreamStatus" = 'active')
+       ) AS "recipientActive",
+       (
+         EXISTS (
+           SELECT 1 FROM torah_appview.actor_block
+           WHERE (creator = $1 AND "subjectDid" = $2)
+              OR (creator = $2 AND "subjectDid" = $1)
+         )
+         OR EXISTS (
+           SELECT 1 FROM torah_appview.list_block AS block
+           JOIN torah_appview.list_item AS item
+             ON item."listUri" = block."subjectUri"
+           WHERE (block.creator = $1 AND item."subjectDid" = $2)
+              OR (block.creator = $2 AND item."subjectDid" = $1)
+         )
+       ) AS blocked,
+       EXISTS (
+         SELECT 1 FROM torah_appview.follow
+         WHERE creator = $2 AND "subjectDid" = $1
+       ) AS "recipientFollowsCaller",
+       (
+         SELECT json FROM torah_appview.record WHERE uri = $3
+       ) AS declaration,
+       (
+         SELECT "takedownRef" FROM torah_appview.record WHERE uri = $3
+       ) AS "declarationTakedown",
+       (
+         SELECT convo.id
+         FROM torah_appview.chat_convo AS convo
+         JOIN torah_appview.chat_member AS mine
+           ON mine.convo_id = convo.id AND mine.did = $1
+         JOIN torah_appview.chat_member AS other
+           ON other.convo_id = convo.id AND other.did = $2
+         WHERE (
+           SELECT COUNT(*) FROM torah_appview.chat_member
+           WHERE convo_id = convo.id
+         ) = 2
+         ORDER BY convo.created_at, convo.id
+         LIMIT 1
+       ) AS "convoId"`,
+    [
+      callerDid,
+      recipientDid,
+      `at://${recipientDid}/chat.bsky.actor.declaration/self`,
+    ],
+  )
+  const row = result.rows[0]
+  const convoId = row.convoId ?? undefined
+  if (!row.callerActive || !row.recipientActive || row.blocked) {
+    return { canChat: false, convoId }
+  }
+  // @NOTE Privacy settings apply to new chats; existing accepted chats continue.
+  if (convoId) return { canChat: true, convoId }
+  if (row.declarationTakedown) return { canChat: false }
+
+  let allowIncoming: unknown = 'following'
+  if (row.declaration !== null) {
+    try {
+      const declaration: unknown =
+        typeof row.declaration === 'string'
+          ? JSON.parse(row.declaration)
+          : row.declaration
+      allowIncoming =
+        declaration &&
+        typeof declaration === 'object' &&
+        !Array.isArray(declaration) &&
+        'allowIncoming' in declaration
+          ? declaration.allowIncoming
+          : undefined
+    } catch {
+      return { canChat: false }
+    }
+  }
+  return {
+    canChat:
+      allowIncoming === 'all' ||
+      (allowIncoming === 'following' && row.recipientFollowsCaller),
+  }
+}
+
+function directMembers(
+  input: unknown,
+  callerDid: string,
+): [string, string] | undefined {
+  const requested = typeof input === 'string' ? [input] : input
+  if (
+    !Array.isArray(requested) ||
+    requested.length < 1 ||
+    requested.length > 10 ||
+    requested.some((did) => !isValidDid(did))
+  ) {
+    return
+  }
+  const members = [...new Set<string>([callerDid, ...requested])].sort()
+  if (members.length !== 2) return
+  return members as [string, string]
+}
+
+async function isChatActorActive(
+  pool: Database['pool'],
+  did: string,
+): Promise<boolean> {
+  const result = await pool.query(
+    `SELECT 1 FROM torah_appview.actor
+     WHERE did = $1 AND "takedownRef" IS NULL
+       AND ("upstreamStatus" IS NULL OR "upstreamStatus" = 'active')`,
+    [did],
+  )
+  return result.rows.length > 0
+}
+
+async function assertCanSend(
+  pool: Database['pool'],
+  convoId: string,
+  callerDid: string,
+): Promise<void> {
+  await assertMembership(pool, convoId, callerDid)
+  const members = await pool.query<{ did: string }>(
+    'SELECT did FROM torah_appview.chat_member WHERE convo_id = $1',
+    [convoId],
+  )
+  if (members.rows.length === 2) {
+    const recipient = members.rows.find((member) => member.did !== callerDid)
+    const policy =
+      recipient && (await getDirectChatPolicy(pool, callerDid, recipient.did))
+    if (!policy?.canChat) {
+      throw new ChatForbiddenError('Messages are unavailable for these members')
+    }
+  } else if (
+    members.rows.length < 2 ||
+    !(await isChatActorActive(pool, callerDid))
+  ) {
+    throw new ChatForbiddenError('This conversation is unavailable')
+  }
+}
+
 /** Create the chat router with mandatory verified service authentication. */
 export function createChatRouter(
   db: Pick<Database, 'pool'>,
@@ -342,17 +514,46 @@ export function createChatRouter(
     }
   })
 
-  // Actor endpoints
-  router.get(
-    '/xrpc/chat.bsky.actor.getStatus',
-    (_req: Request, res: Response) => {
-      res.json({
-        status: {
-          allowIncoming: 'all',
-        },
+  router.get('/xrpc/chat.bsky.convo.getConvoAvailability', async (req, res) => {
+    const callerDid = getCallerDid(res)
+    const members = directMembers(req.query.members, callerDid)
+    if (!members) {
+      return res.status(400).json({
+        error: 'InvalidRequest',
+        message:
+          'Exactly two distinct actors are required for a direct conversation',
       })
-    },
-  )
+    }
+    try {
+      const recipient = members.find((did) => did !== callerDid)!
+      const policy = await getDirectChatPolicy(db.pool, callerDid, recipient)
+      const convo = policy.convoId
+        ? await buildConvoView(db.pool, policy.convoId, callerDid)
+        : undefined
+      return res.json({ canChat: policy.canChat, ...(convo ? { convo } : {}) })
+    } catch {
+      return res.status(500).json({
+        error: 'InternalServerError',
+        message: 'Unable to check conversation availability',
+      })
+    }
+  })
+
+  router.get('/xrpc/chat.bsky.actor.getStatus', async (_req, res) => {
+    try {
+      const active = await isChatActorActive(db.pool, getCallerDid(res))
+      return res.json({
+        chatDisabled: !active,
+        canCreateGroups: false,
+        groupMemberLimit: 0,
+      })
+    } catch {
+      return res.status(500).json({
+        error: 'InternalServerError',
+        message: 'Unable to load chat status',
+      })
+    }
+  })
 
   router.get(
     '/xrpc/chat.bsky.actor.exportAccountData',
@@ -376,39 +577,27 @@ export function createChatRouter(
   const handleGetConvoForMembers = async (req: Request, res: Response) => {
     try {
       const callerDid = getCallerDid(res)
-      let members: string[] = []
-      if (req.method === 'POST') {
-        members = req.body?.members || []
-      } else {
-        const q = req.query.members
-        members = Array.isArray(q) ? (q as string[]) : q ? [q as string] : []
-      }
-      if (!members.includes(callerDid)) {
-        members.push(callerDid)
-      }
-      members = Array.from(new Set(members)).sort()
-
-      if (members.length < 2) {
+      const members = directMembers(
+        req.method === 'POST' ? req.body?.members : req.query.members,
+        callerDid,
+      )
+      if (!members) {
         return res.status(400).json({
           error: 'InvalidRequest',
-          message: 'At least 2 members required',
+          message:
+            'Exactly two distinct actors are required for a direct conversation',
         })
       }
-
-      // Check if convo already exists with these exact members
-      const existingRes = await db.pool.query(
-        `SELECT convo_id FROM torah_appview.chat_member
-         WHERE convo_id IN (
-           SELECT convo_id FROM torah_appview.chat_member WHERE did = ANY($1::text[])
-           GROUP BY convo_id HAVING COUNT(*) = $2
-         )
-         GROUP BY convo_id HAVING COUNT(*) = $2`,
-        [members, members.length],
-      )
-
+      const recipient = members.find((did) => did !== callerDid)!
+      const policy = await getDirectChatPolicy(db.pool, callerDid, recipient)
+      if (!policy.canChat) {
+        throw new ChatForbiddenError(
+          'Messages are unavailable for these members',
+        )
+      }
       let convoId: string
-      if (existingRes.rows.length > 0) {
-        convoId = existingRes.rows[0].convo_id
+      if (policy.convoId) {
+        convoId = policy.convoId
       } else {
         convoId = `c_${TID.nextStr()}`
         const rev = TID.nextStr()
@@ -427,6 +616,11 @@ export function createChatRouter(
       const convo = await buildConvoView(db.pool, convoId, callerDid)
       return res.json({ convo })
     } catch (err: any) {
+      if (err instanceof ChatForbiddenError) {
+        return res
+          .status(403)
+          .json({ error: 'Forbidden', message: err.message })
+      }
       return res.status(500).json({
         error: 'InternalServerError',
         message: err?.message || 'Chat error',
@@ -578,15 +772,7 @@ export function createChatRouter(
           })
         }
 
-        const memberCheck = await db.pool.query(
-          'SELECT 1 FROM torah_appview.chat_member WHERE convo_id = $1 AND did = $2',
-          [convoId, callerDid],
-        )
-        if (memberCheck.rows.length === 0) {
-          return res
-            .status(403)
-            .json({ error: 'Forbidden', message: 'Not a member of this convo' })
-        }
+        await assertCanSend(db.pool, convoId, callerDid)
 
         const msgId = `m_${TID.nextStr()}`
         const rev = TID.nextStr()
@@ -625,6 +811,11 @@ export function createChatRouter(
 
         return res.json(messageView)
       } catch (err: any) {
+        if (err instanceof ChatForbiddenError) {
+          return res
+            .status(403)
+            .json({ error: 'Forbidden', message: err.message })
+        }
         return res.status(500).json({
           error: 'InternalServerError',
           message: err?.message || 'Chat error',
@@ -660,7 +851,7 @@ export function createChatRouter(
         }
         // @NOTE Authorize the entire batch before the first write.
         for (const item of items) {
-          await assertMembership(db.pool, item.convoId, callerDid)
+          await assertCanSend(db.pool, item.convoId, callerDid)
         }
         for (const item of items) {
           const { convoId, message } = item
