@@ -16,6 +16,11 @@ Potential improvements, features, optimizations, or architectural ideas.
 
 Useful technical discoveries, undocumented behavior, shortcuts, implementation tricks, platform behavior, or reusable knowledge discovered while working.
 
+- Torah chat service authentication must use the AppView standard verifier: the actor is the verified JWT issuer, and `#bsky_chat` selects the proxy endpoint rather than forming part of the JWT audience. Register the advertised bare DID as an alternate audience.
+- Concurrent new direct-chat opens use a stable full-SHA256 pair identifier and one atomic SQL statement; preserve legacy pair IDs and keep authorization independent of ID guessability.
+- DM declarations default to `following`, with the recipient following the sender. Existing accepted direct chats continue after privacy-setting changes; availability, creation, and send checks must share the same block/actor-status policy.
+- `services/torah-appview` runs TypeScript directly on Node 24. Its local `.ts` imports are intentional; the build config rewrites them for compiled output. Chat SQL regression tests require an empty isolated database and refuse an existing `torah_appview` schema.
+
 ## Experiments / Investigations
 
 Things worth testing or researching before deciding whether to implement them.

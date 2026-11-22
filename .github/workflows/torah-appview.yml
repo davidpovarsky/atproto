@@ -1,81 +1,76 @@
 name: Torah Social AppView
-
 on:
   push:
     branches:
       - codex/torah-social-foundation
+      - codex/torah-social-runtime-repair
+      - codex/torah-chat-runtime-repair-20261122
+  pull_request:
+    branches:
+      - codex/torah-social-runtime-repair
+    paths:
+      - services/torah-appview/**
+      - pnpm-lock.yaml
+      - .github/workflows/torah-appview.yml
   workflow_dispatch:
-
+permissions:
+  contents: read
+concurrency:
+  group: torah-appview-${{ github.ref }}
+  cancel-in-progress: true
 jobs:
   verify:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: torah_chat_test
+          POSTGRES_USER: torah_chat_test
+          POSTGRES_PASSWORD: torah_chat_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U torah_chat_test -d torah_chat_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      CI: '1'
+      NODE_OPTIONS: --max-old-space-size=6144
+      PUPPETEER_SKIP_DOWNLOAD: 'true'
+      TORAH_CHAT_TEST_DATABASE_URL: postgres://torah_chat_test:torah_chat_test@127.0.0.1:5432/torah_chat_test
     steps:
-      - name: Live Activity · refresh
-        uses: davidpovarsky/github-automation/live-refresh@main
-        continue-on-error: true
-        with:
-          event: refresh
-          device_id: ${{ secrets.NOTIFY_DEVICE_ID }}
-          token: ${{ secrets.NOTIFY_DEVICE_TOKEN }}
-          github_token: ${{ github.token }}
-      - uses: actions/checkout@v4
-
-      - name: Live Activity · refresh
-        uses: davidpovarsky/github-automation/live-refresh@main
-        continue-on-error: true
-        with:
-          event: refresh
-          device_id: ${{ secrets.NOTIFY_DEVICE_ID }}
-          token: ${{ secrets.NOTIFY_DEVICE_TOKEN }}
-          github_token: ${{ github.token }}
-      - uses: pnpm/action-setup@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1
         with:
           version: 11.11.0
-
-      - name: Live Activity · refresh
-        uses: davidpovarsky/github-automation/live-refresh@main
-        continue-on-error: true
+          run_install: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
         with:
-          event: refresh
-          device_id: ${{ secrets.NOTIFY_DEVICE_ID }}
-          token: ${{ secrets.NOTIFY_DEVICE_TOKEN }}
-          github_token: ${{ github.token }}
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 24
+          node-version: 24.22.1
           cache: pnpm
-
-      - name: Live Activity · refresh
-        uses: davidpovarsky/github-automation/live-refresh@main
-        continue-on-error: true
+      - name: Install exact workspace dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Build shared tooling
+        run: pnpm run build:tooling --force
+      - name: Build the AppView service and its dependencies
+        run: pnpm --recursive --stream --workspace-concurrency=1 --config.include-workspace-root=false --filter 'torah-appview-service...' run build
+      - name: Typecheck service and regression tests
+        working-directory: services/torah-appview
+        run: pnpm run verify:types
+      - name: Verify authentication, membership and real unread-count SQL
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          pnpm --dir services/torah-appview exec vitest run --reporter=default --reporter=junit --outputFile.junit=../../artifacts/chat-junit.xml 2>&1 | tee artifacts/torah-chat-tests.log
+      - name: Upload actual chat test evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          event: refresh
-          device_id: ${{ secrets.NOTIFY_DEVICE_ID }}
-          token: ${{ secrets.NOTIFY_DEVICE_TOKEN }}
-          github_token: ${{ github.token }}
-      - name: Install dependencies
-        run: pnpm install --no-frozen-lockfile
-        env:
-          PUPPETEER_SKIP_DOWNLOAD: 'true'
-
-      - name: Live Activity · refresh
-        uses: davidpovarsky/github-automation/live-refresh@main
-        continue-on-error: true
-        with:
-          event: refresh
-          device_id: ${{ secrets.NOTIFY_DEVICE_ID }}
-          token: ${{ secrets.NOTIFY_DEVICE_TOKEN }}
-          github_token: ${{ github.token }}
-      - name: Build service dependencies
-        run: pnpm run --recursive --stream --workspace-concurrency 1 --filter 'torah-appview-service...' build -- --force
-
-      - name: Live Activity · refresh
-        uses: davidpovarsky/github-automation/live-refresh@main
-        continue-on-error: true
-        with:
-          event: refresh
-          device_id: ${{ secrets.NOTIFY_DEVICE_ID }}
-          token: ${{ secrets.NOTIFY_DEVICE_TOKEN }}
-          github_token: ${{ github.token }}
-      - name: Typecheck Torah AppView
-        run: pnpm exec tsc -p services/torah-appview/tsconfig.json --noEmit
+          name: torah-appview-chat-tests-${{ github.sha }}
+          path: artifacts/
+          if-no-files-found: warn
+          retention-days: 14
