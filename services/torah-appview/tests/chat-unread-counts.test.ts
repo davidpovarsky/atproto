@@ -11,7 +11,9 @@ import {
 } from 'vitest'
 import type { Database } from '@atproto/bsky'
 import {
+  getAcceptedConvoIds,
   getDirectChatPolicy,
+  getOrCreateDirectConvo,
   getUnreadCounts,
   initChatTables,
 } from '../chat.ts'
@@ -500,5 +502,119 @@ describe('PostgreSQL direct chat privacy', () => {
     await declaration('all')
     await client.query('DELETE FROM torah_appview.actor WHERE did = $1', [B])
     expect((await getDirectChatPolicy(pool, A, B)).canChat).toBe(false)
+  })
+})
+
+describe('PostgreSQL atomic direct conversation creation', () => {
+  it('converges opposite-side opens that both observed an absent pair', async () => {
+    await follow(A, B)
+    await follow(B, A)
+    let absentLookups = 0
+    const observedPool = {
+      async query(text: string, params: unknown[]) {
+        const result = await client.query(text, params)
+        if (
+          text.includes('AS "callerActive"') &&
+          result.rows[0].convoId === null
+        ) {
+          absentLookups++
+        }
+        return result
+      },
+    } as unknown as Database['pool']
+    const [first, second] = await Promise.all([
+      getOrCreateDirectConvo(observedPool, A, B),
+      getOrCreateDirectConvo(observedPool, B, A),
+    ])
+    expect(absentLookups).toBe(2)
+    expect(first).toBe(second)
+    expect(first).toMatch(/^c_[0-9a-f]{64}$/)
+    expect(
+      (
+        await client.query(
+          'SELECT COUNT(*)::int AS count FROM torah_appview.chat_convo',
+        )
+      ).rows[0].count,
+    ).toBe(1)
+    const members = await client.query(
+      'SELECT did FROM torah_appview.chat_member ORDER BY did',
+    )
+    expect(members.rows.map((row) => row.did)).toEqual([A, B])
+  })
+
+  it('preserves the existing legacy conversation ID', async () => {
+    await conversation('legacy-random-convo')
+    await declaration('none')
+    expect(await getOrCreateDirectConvo(pool, A, B)).toBe('legacy-random-convo')
+    expect(await getOrCreateDirectConvo(pool, B, A)).toBe('legacy-random-convo')
+    expect(
+      (
+        await client.query(
+          'SELECT COUNT(*)::int AS count FROM torah_appview.chat_convo',
+        )
+      ).rows[0].count,
+    ).toBe(1)
+  })
+
+  it('rolls back the conversation and first membership if the second membership fails', async () => {
+    await follow(A, B)
+    await follow(B, A)
+    await client.query(`
+      CREATE FUNCTION torah_appview.reject_fixture_member() RETURNS trigger
+      LANGUAGE plpgsql AS $$
+      BEGIN
+        RAISE EXCEPTION 'fixture member insertion failure';
+      END;
+      $$;
+      CREATE TRIGGER reject_fixture_member
+      BEFORE INSERT ON torah_appview.chat_member
+      FOR EACH ROW WHEN (NEW.did = '${B}')
+      EXECUTE FUNCTION torah_appview.reject_fixture_member();
+    `)
+    await client.query('SAVEPOINT atomic_creation')
+    await expect(getOrCreateDirectConvo(pool, A, B)).rejects.toThrow(
+      'fixture member insertion failure',
+    )
+    await client.query('ROLLBACK TO SAVEPOINT atomic_creation')
+    expect(
+      (
+        await client.query(
+          'SELECT COUNT(*)::int AS count FROM torah_appview.chat_convo',
+        )
+      ).rows[0].count,
+    ).toBe(0)
+    expect(
+      (
+        await client.query(
+          'SELECT COUNT(*)::int AS count FROM torah_appview.chat_member',
+        )
+      ).rows[0].count,
+    ).toBe(0)
+    await client.query('RELEASE SAVEPOINT atomic_creation')
+  })
+})
+
+describe('PostgreSQL accepted conversation kind filters', () => {
+  test.each([
+    { kind: undefined, expected: ['direct', 'group'] },
+    { kind: 'direct' as const, expected: ['direct'] },
+    { kind: 'group' as const, expected: ['group'] },
+  ])(
+    'kind=$kind returns only the requested memberships',
+    async ({ kind, expected }) => {
+      await conversation('direct', [A, B])
+      await conversation('group', [A, B, C])
+      await conversation('other-actors', [B, C])
+      expect((await getAcceptedConvoIds(pool, A, 50, kind)).sort()).toEqual(
+        expected,
+      )
+    },
+  )
+
+  it('applies the requested page limit after the kind filter', async () => {
+    await conversation('direct-old', [A, B])
+    await conversation('direct-new', [A, C])
+    await conversation('group', [A, B, C])
+    expect(await getAcceptedConvoIds(pool, A, 1, 'direct')).toHaveLength(1)
   })
 })

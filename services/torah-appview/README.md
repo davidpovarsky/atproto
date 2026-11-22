@@ -51,6 +51,14 @@ prevent sending. The existing service has no group-creation implementation:
 `groupMemberLimit: 0`, and `getConvoForMembers` only creates direct chats.
 Existing group membership records are preserved.
 
+New direct pairs use a full SHA256 identifier of the sorted, JSON-encoded DIDs;
+legacy conversation IDs are reused. A single SQL statement creates the conversation
+and both memberships atomically, with the existing primary key serializing
+simultaneous creation. Identifiers do not grant access: every conversation access
+still requires verified membership. Request-list queries return an empty list
+because the legacy tables contain accepted memberships only. Direct/group list
+filters use actual membership counts, so direct-only clients do not receive groups.
+
 ## Verification
 
 Run from `services/torah-appview` after building workspace dependencies:

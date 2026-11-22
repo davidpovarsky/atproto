@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto'
 import express, { type Request, type Response, Router } from 'express'
 import type { Database } from '@atproto/bsky'
 import { TID } from '@atproto/common'
@@ -389,6 +390,73 @@ export async function getDirectChatPolicy(
   }
 }
 
+/** Reuse legacy direct IDs and atomically create a single new pair conversation. */
+export async function getOrCreateDirectConvo(
+  pool: Database['pool'],
+  callerDid: string,
+  recipientDid: string,
+): Promise<string> {
+  const policy = await getDirectChatPolicy(pool, callerDid, recipientDid)
+  if (!policy.canChat) {
+    throw new ChatForbiddenError('Messages are unavailable for these members')
+  }
+  if (policy.convoId) return policy.convoId
+
+  const members = [callerDid, recipientDid].sort()
+  const pairHash = createHash('sha256')
+    .update(JSON.stringify(members))
+    .digest('hex')
+  const id = `c_${pairHash}`
+  // @NOTE One statement keeps both membership inserts atomic. The existing
+  // convo primary key serializes callers that observed the same absent pair.
+  const result = await pool.query<{ id: string }>(
+    `WITH saved_convo AS (
+       INSERT INTO torah_appview.chat_convo (id, rev)
+       VALUES ($1, $2)
+       ON CONFLICT (id) DO UPDATE SET id = EXCLUDED.id
+       RETURNING id
+     ), saved_members AS (
+       INSERT INTO torah_appview.chat_member (convo_id, did)
+       SELECT saved_convo.id, member.did
+       FROM saved_convo
+       CROSS JOIN UNNEST($3::text[]) AS member(did)
+       ON CONFLICT (convo_id, did) DO NOTHING
+       RETURNING convo_id
+     )
+     SELECT id FROM saved_convo`,
+    [id, TID.nextStr(), members],
+  )
+  return result.rows[0].id
+}
+
+/** List only the accepted memberships represented by the legacy chat tables. */
+export async function getAcceptedConvoIds(
+  pool: Database['pool'],
+  callerDid: string,
+  limit: number,
+  kind?: 'direct' | 'group',
+): Promise<string[]> {
+  const result = await pool.query<{ id: string }>(
+    `SELECT c.id FROM torah_appview.chat_convo c
+     JOIN torah_appview.chat_member m ON m.convo_id = c.id
+     WHERE m.did = $1
+       AND (
+         $3::text IS NULL
+         OR ($3 = 'direct' AND (
+           SELECT COUNT(*) FROM torah_appview.chat_member members
+           WHERE members.convo_id = c.id
+         ) = 2)
+         OR ($3 = 'group' AND (
+           SELECT COUNT(*) FROM torah_appview.chat_member members
+           WHERE members.convo_id = c.id
+         ) > 2)
+       )
+     ORDER BY c.updated_at DESC, c.id DESC LIMIT $2`,
+    [callerDid, limit, kind ?? null],
+  )
+  return result.rows.map((row) => row.id)
+}
+
 function directMembers(
   input: unknown,
   callerDid: string,
@@ -589,30 +657,11 @@ export function createChatRouter(
         })
       }
       const recipient = members.find((did) => did !== callerDid)!
-      const policy = await getDirectChatPolicy(db.pool, callerDid, recipient)
-      if (!policy.canChat) {
-        throw new ChatForbiddenError(
-          'Messages are unavailable for these members',
-        )
-      }
-      let convoId: string
-      if (policy.convoId) {
-        convoId = policy.convoId
-      } else {
-        convoId = `c_${TID.nextStr()}`
-        const rev = TID.nextStr()
-        await db.pool.query(
-          'INSERT INTO torah_appview.chat_convo (id, rev) VALUES ($1, $2)',
-          [convoId, rev],
-        )
-        for (const memberDid of members) {
-          await db.pool.query(
-            'INSERT INTO torah_appview.chat_member (convo_id, did) VALUES ($1, $2)',
-            [convoId, memberDid],
-          )
-        }
-      }
-
+      const convoId = await getOrCreateDirectConvo(
+        db.pool,
+        callerDid,
+        recipient,
+      )
       const convo = await buildConvoView(db.pool, convoId, callerDid)
       return res.json({ convo })
     } catch (err: any) {
@@ -679,19 +728,48 @@ export function createChatRouter(
     async (req: Request, res: Response) => {
       try {
         const callerDid = getCallerDid(res)
-        const limit = parseInt((req.query.limit as string) || '50', 10)
-        const convosRes = await db.pool.query(
-          `SELECT c.id FROM torah_appview.chat_convo c
-         JOIN torah_appview.chat_member m ON m.convo_id = c.id
-         WHERE m.did = $1
-         ORDER BY c.updated_at DESC LIMIT $2`,
-          [callerDid, limit],
+        const status = req.query.status
+        if (
+          status !== undefined &&
+          status !== 'accepted' &&
+          status !== 'request'
+        ) {
+          return res.status(400).json({
+            error: 'InvalidRequest',
+            message: 'status must be accepted or request',
+          })
+        }
+        const limit =
+          req.query.limit === undefined ? 50 : Number(req.query.limit)
+        if (
+          (req.query.limit !== undefined &&
+            typeof req.query.limit !== 'string') ||
+          !Number.isInteger(limit) ||
+          limit < 1 ||
+          limit > 100
+        ) {
+          return res.status(400).json({
+            error: 'InvalidRequest',
+            message: 'limit must be an integer between 1 and 100',
+          })
+        }
+        const kind = req.query.kind
+        if (kind !== undefined && kind !== 'direct' && kind !== 'group') {
+          return res.status(400).json({
+            error: 'InvalidRequest',
+            message: 'kind must be direct or group',
+          })
+        }
+        // @NOTE The legacy tables contain accepted memberships only.
+        if (status === 'request') return res.json({ convos: [] })
+        const convoIds = await getAcceptedConvoIds(
+          db.pool,
+          callerDid,
+          limit,
+          kind,
         )
-
         const convos = await Promise.all(
-          convosRes.rows.map((r: any) =>
-            buildConvoView(db.pool, r.id, callerDid),
-          ),
+          convoIds.map((id) => buildConvoView(db.pool, id, callerDid)),
         )
 
         return res.json({

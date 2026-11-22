@@ -111,10 +111,14 @@ function makePool(options: FixtureOptions = {}) {
         ) {
           rows = [{ member: 1 }]
         }
+      } else if (sql.includes('WITH saved_convo AS')) {
+        rows = [{ id: params[0] }]
+      } else if (sql.includes('SELECT c.id FROM torah_appview.chat_convo c')) {
+        rows = [{ id: CONVO_AB }]
       } else if (sql.includes('SELECT id, rev, created_at')) {
         rows = [
           {
-            id: CONVO_AB,
+            id: params[0],
             rev: '1',
             created_at: new Date(),
             updated_at: new Date(),
@@ -415,7 +419,7 @@ describe('chat membership and read state', () => {
       expect(response.status).toBe(403)
       expect(
         fixture.queries.filter(({ sql }) =>
-          /^(INSERT|UPDATE|DELETE)/.test(sql),
+          /^(INSERT|UPDATE|DELETE|WITH saved_convo)/.test(sql),
         ),
       ).toHaveLength(0)
     },
@@ -476,7 +480,9 @@ describe('chat membership and read state', () => {
     )
     expect(response.status).toBe(403)
     expect(
-      fixture.queries.filter(({ sql }) => /^(INSERT|UPDATE|DELETE)/.test(sql)),
+      fixture.queries.filter(({ sql }) =>
+        /^(INSERT|UPDATE|DELETE|WITH saved_convo)/.test(sql),
+      ),
     ).toHaveLength(0)
   })
 
@@ -582,7 +588,9 @@ describe('direct chat availability and enforcement', () => {
     expect(response.body.canChat).toBe(true)
     expect(response.body.convo.id).toBe(CONVO_AB)
     expect(
-      fixture.queries.filter(({ sql }) => /^(INSERT|UPDATE|DELETE)/.test(sql)),
+      fixture.queries.filter(({ sql }) =>
+        /^(INSERT|UPDATE|DELETE|WITH saved_convo)/.test(sql),
+      ),
     ).toHaveLength(0)
   })
 
@@ -598,7 +606,9 @@ describe('direct chat availability and enforcement', () => {
     )
     expect(response).toEqual({ status: 200, body: { canChat: true } })
     expect(
-      fixture.queries.filter(({ sql }) => /^(INSERT|UPDATE|DELETE)/.test(sql)),
+      fixture.queries.filter(({ sql }) =>
+        /^(INSERT|UPDATE|DELETE|WITH saved_convo)/.test(sql),
+      ),
     ).toHaveLength(0)
   })
 
@@ -644,7 +654,7 @@ describe('direct chat availability and enforcement', () => {
       expect(response.status).toBe(403)
       expect(
         fixture.queries.filter(({ sql }) =>
-          /^(INSERT|UPDATE|DELETE)/.test(sql),
+          /^(INSERT|UPDATE|DELETE|WITH saved_convo)/.test(sql),
         ),
       ).toHaveLength(0)
     },
@@ -668,7 +678,7 @@ describe('direct chat availability and enforcement', () => {
       expect(response.status).toBe(403)
       expect(
         fixture.queries.filter(({ sql }) =>
-          /^(INSERT|UPDATE|DELETE)/.test(sql),
+          /^(INSERT|UPDATE|DELETE|WITH saved_convo)/.test(sql),
         ),
       ).toHaveLength(0)
     },
@@ -693,4 +703,70 @@ describe('direct chat availability and enforcement', () => {
       true,
     )
   })
+})
+
+describe('accepted-only legacy conversation lists', () => {
+  it('returns an empty request list without duplicating accepted conversations', async () => {
+    await using fixture = await startFixture()
+    const token = await makeToken(DID_A, 'chat.bsky.convo.listConvos')
+    const response = await fixture.request(
+      'GET',
+      '/xrpc/chat.bsky.convo.listConvos?status=request',
+      token,
+    )
+    expect(response).toEqual({ status: 200, body: { convos: [] } })
+    expect(fixture.queries).toHaveLength(0)
+  })
+
+  test.each(['', '?status=accepted'])(
+    'list query %s returns accepted conversations',
+    async (query) => {
+      await using fixture = await startFixture()
+      const token = await makeToken(DID_A, 'chat.bsky.convo.listConvos')
+      const response = await fixture.request(
+        'GET',
+        `/xrpc/chat.bsky.convo.listConvos${query}`,
+        token,
+      )
+      expect(response.status).toBe(200)
+      expect(response.body.convos).toHaveLength(1)
+      expect(response.body.convos[0].id).toBe(CONVO_AB)
+      expect(response.body.convos[0].status).toBe('accepted')
+    },
+  )
+
+  test.each([
+    '?status=unknown',
+    '?kind=unknown',
+    '?limit=0',
+    '?limit=101',
+    '?limit=not-a-number',
+  ])(
+    'invalid list query %s is rejected before database access',
+    async (query) => {
+      await using fixture = await startFixture()
+      const token = await makeToken(DID_A, 'chat.bsky.convo.listConvos')
+      const response = await fixture.request(
+        'GET',
+        `/xrpc/chat.bsky.convo.listConvos${query}`,
+        token,
+      )
+      expect(response.status).toBe(400)
+      expect(fixture.queries).toHaveLength(0)
+    },
+  )
+  test.each(['direct', 'group'] as const)(
+    'passes the requested %s conversation kind to the database filter',
+    async (kind) => {
+      await using fixture = await startFixture()
+      const token = await makeToken(DID_A, 'chat.bsky.convo.listConvos')
+      const response = await fixture.request(
+        'GET',
+        `/xrpc/chat.bsky.convo.listConvos?status=accepted&kind=${kind}&limit=10`,
+        token,
+      )
+      expect(response.status).toBe(200)
+      expect(fixture.queries[0].params).toEqual([DID_A, 10, kind])
+    },
+  )
 })
