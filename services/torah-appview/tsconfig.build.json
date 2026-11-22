@@ -1,6 +1,6 @@
 {
   "extends": ["../../tsconfig/node.tsconfig.json"],
-  "include": ["./index.ts", "./chat.ts"],
+  "include": ["./index.ts", "./chat.ts", "./image-compat.ts"],
   "references": [
     {
       "path": "../../packages/bsky/tsconfig.build.json"

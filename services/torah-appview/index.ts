@@ -3,6 +3,7 @@ import * as bsync from '@atproto/bsync'
 import { Secp256k1Keypair } from '@atproto/crypto'
 import { type DidString, ensureValidDid } from '@atproto/syntax'
 import { createChatRouter, initChatTables } from './chat.ts'
+import { installAvatarThumbnailAlias } from './image-compat.ts'
 
 const APPVIEW_PORT = 2584
 const BSYNC_PORT = 2585
@@ -109,6 +110,7 @@ async function main() {
   } else {
     stack.unshift(chatLayer)
   }
+  installAvatarThumbnailAlias(appview.app, chatRouter)
   const bsyncSub = new bsky.BsyncSubscription({ config, db })
   const repoSub = new bsky.RepoSubscription({
     service: repoProvider,

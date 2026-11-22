@@ -23,6 +23,19 @@ The container starts `node --enable-source-maps index.ts` on Node 24.
 Local imports deliberately use `.ts` so direct execution works.
 The build config rewrites these extensions when producing optional `dist` output.
 
+## Avatar thumbnail compatibility
+
+The current client requests `/img/avatar_thumbnail/plain/<did>/<cid>`, while
+the installed AppView image processor exposes the `avatar` preset.
+A service-local middleware aliases that exact prefix for GET and HEAD before
+the existing image route. It preserves the remaining URL and original request
+URL, and leaves other methods, paths, and chat authentication unchanged.
+
+The alias reuses the existing avatar rendering preset and cache; it does not
+introduce a new 100-pixel thumbnail encoder. Existing format, DID, CID, blob
+takedown, and content verification still run through the upstream image route.
+No redirect, new blob fetcher, or public-network fallback is added.
+
 ## Unread counts
 
 The existing chat tables represent accepted conversations without request,
