@@ -16,6 +16,7 @@ Potential improvements, features, optimizations, or architectural ideas.
 
 Useful technical discoveries, undocumented behavior, shortcuts, implementation tricks, platform behavior, or reusable knowledge discovered while working.
 
+- The client uses the CDN-style `avatar_thumbnail` preset, while the bundled image server supports `avatar`. A service-local GET/HEAD prefix alias must run before the image route and reuse its validation, cache, and existing rendering size.
 - Torah chat service authentication must use the AppView standard verifier: the actor is the verified JWT issuer, and `#bsky_chat` selects the proxy endpoint rather than forming part of the JWT audience. Register the advertised bare DID as an alternate audience.
 - Concurrent new direct-chat opens use a stable full-SHA256 pair identifier and one atomic SQL statement; preserve legacy pair IDs and keep authorization independent of ID guessability.
 - DM declarations default to `following`, with the recipient following the sender. Existing accepted direct chats continue after privacy-setting changes; availability, creation, and send checks must share the same block/actor-status policy.
